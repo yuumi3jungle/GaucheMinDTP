@@ -309,7 +309,8 @@
 ;;        Either "top", "bottom", or "none" (do not allow adding comments).
 
 (define-reader-macro (comment . opts)
-  (let-macro-keywords* opts ((id (ref (wiliki-current-page)'key))
+  (let-macro-keywords* opts ((id (and-let* ([p (wiliki-current-page)])
+                                   (ref p'key)))
                              (order "old->new")
                              (textarea "bottom"))
     ;; argument check
@@ -317,11 +318,13 @@
       (error "$$comment: Invalid 'order' argument (must be either old->new or new->old):" order))
     (unless (member textarea '("bottom" "top" "none"))
       (error "$$comment: Invalid 'textarea' argument (must be either one of bottom, top or none):" textarea))
-    ;; If the page that contains $$comment macro is included in another page,
-    ;; we only show the summary.
-    (if (wiliki:current-page-being-included?)
-      (comment-summary id)
-      (comment-input-and-display id order textarea))))
+    (cond [(not id) '()]
+          [(wiliki:current-page-being-included?)
+           ;; If the page that contains $$comment macro is included in
+           ;; another page, we only show the summary.
+           (comment-summary id)]
+          [else
+           (comment-input-and-display id order textarea)])))
 
 (define (comment-input-and-display id order textarea)
   (random-source-randomize! default-random-source)
@@ -418,9 +421,32 @@
   ;; See cmd-commit-edit in edit.scm; probably we should consolidate
   ;; those heuristic spam filtering into one module.
   (define (filter-suspicious content)
-    (and (string? content)
-         (not (#/<a\s+href=[\"'\s]*http/i content))
-         content))
+    (cond [(or (not (string? content))
+               (#/<a\s+href=[\"'\s]*http/i content)
+               (#/^\s*comment\d*\s*$/i content)  ; temporary
+               (#/^\s*[\d\;_.tx]+\s*$/ content)) ; temporary
+           (wiliki:log-event "rejecting spam comment for ~s: name=~s content=~s"
+                             pagename n content)
+           #f]
+          ;; If the content has some amount and consists entirely of a bunch
+          ;; of URLs, it's likely a spam.
+          [(and (> (string-size content) 250)
+                (let1 p (/. (string-size (regexp-replace-all*
+                                          content
+                                          #/http:\/\/[:\w\/%&?=.,+#-]+/ ""
+                                          #/[\t-@\[-^`\{-\x7f]/ ""))
+                            (string-size content))
+                  (and (< p 0.24) p)))
+           => (lambda (p)
+                (wiliki:log-event "too much urls in comment (ratio=~a)" p)
+                #f)]
+          ;; See if there are too many URLs (we should allow many URLs in
+          ;; the main content, but for the comment, we may say it's too
+          ;; suspicious.)
+          [(let1 c (length (string-split content #/http:\/\/[:\w\/%&?=.,+#-]+/))
+             (and (> c 12) c))
+           => (lambda (c) (format "too many urls in comment (~a)" (- c 1)) #f)]
+          [else content]))
 
   ;; Find maximum comment count
   (define (max-comment-count)
@@ -437,14 +463,20 @@
                [ (< (- now 7200) t now) ]
                [content (filter-suspicious (get-legal-post-content))]
                [ (> (string-length content) 0) ]
-               [cnt (+ (max-comment-count) 1)])
-      (cmd-commit-edit (format "~a~3'0d" (comment-prefix cid) cnt)
+               [cnt (+ (max-comment-count) 1)]
+               [comment-page (format "~a~3'0d" (comment-prefix cid) cnt)])
+      ;; ignore the result of cmd-commit-edit.  we'll redirect to the
+      ;; main page anyway.
+      (cmd-commit-edit comment-page
                        (string-append
                         "* "n" ("
                         (sys-strftime "%Y/%m/%d %T" (sys-localtime now))
                         "):\n<<<\n"content"\n>>>\n")
                        t "" #t #t)
-      (wiliki:db-touch! pagename)))
+      ;; cmd-commit-edit may reject creating comment page if it thinks
+      ;; the content is spam.  See if comment page is actually created.
+      (when (wiliki:db-exists? comment-page)
+        (wiliki:db-touch! pagename))))
 
   (do-post)
   (wiliki:redirect-page pagename))

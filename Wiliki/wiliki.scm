@@ -49,6 +49,7 @@
   (use wiliki.macro)
   (extend wiliki.core)
   (export <wiliki> wiliki-main
+          <wiliki-formatter>
           wiliki:language-link wiliki:make-navi-button
           wiliki:top-link wiliki:edit-link wiliki:history-link
           wiliki:all-link wiliki:recent-link wiliki:search-box
@@ -394,19 +395,19 @@
     '()))
 
 (define (wiliki:default-head-elements page opts)
-  `((title ,(ref page 'title))
-    ,@(or (and-let* ((w (wiliki))
-                     (fsp (full-script-path-of w)))
-            `((base (@ (href ,fsp)))
-              (link (@ (rel "alternate") (type "application/rss+xml")
-                       (title "RSS") (href ,(format "~a?c=rss" fsp))))))
-          '())
-    ,(or (and-let* ((w (wiliki)) (ss (style-sheet-of w)))
-           `(link (@ (rel "stylesheet") (href ,ss) (type "text/css"))))
-         ;; default
-         '(style (@ (type "text/css"))
-            "body { background-color: #eeeedd }"))
-    ))
+  (let1 w (wiliki)
+    `((title ,(wiliki:format-head-title (the-formatter) page))
+      ,@(cond-list
+         [w `(base (@ (href ,(wiliki:url :full))))]
+         [w `(link (@ (rel "alternate") (type "application/rss+xml")
+                      (title "RSS") (href ,(wiliki:url :full "c=rss"))))]
+         [(and w (ref w'style-sheet))
+          => @(lambda (ss)
+                (map (lambda (s)
+                       `(link (@ (rel "stylesheet")
+                                 (href ,s) (type "text/css"))))
+                     (if (list? ss) ss (list ss))))])
+      )))
 
 (define (default-format-time time)
   (if time
@@ -418,7 +419,7 @@
 (define (default-format-wikiname name)
   (define (inter-wikiname-prefix head)
     (and-let* ([page (wiliki:db-get "InterWikiName")]
-               [rx   (string->regexp #`"^:,|head|:\\s*")])
+               [rx   (string->regexp #`"^:,(regexp-quote head):\\s*")])
       (call-with-input-string (ref page 'content)
         (lambda (p)
           (let loop ((line (read-line p)))
@@ -468,14 +469,21 @@
       )
   )
 
+;; Ideally, default-format-wikiname &c should be defined as a method
+;; specialized for <wiliki-formatter>.  However we need to keep the
+;; old protocol for the backward compatibility; existing wiliki app
+;; may customize the formatter by setting slots.  Newly written scripts
+;; should customize by subclassing <wiliki-formatter>, *not* by setting
+;; slots.
+(define-class <wiliki-formatter> (<wiliki-formatter-base>)
+  (;; for backward compatibility.
+   (bracket :init-value default-format-wikiname)
+   (time    :init-value default-format-time)
+   (header  :init-value wiliki:default-page-header)
+   (footer  :init-value wiliki:default-page-footer)
+   (head-elements :init-value wiliki:default-head-elements)))
 
-(wiliki:formatter
- (make <wiliki-formatter>
-   :bracket       default-format-wikiname
-   :time          default-format-time
-   :header        wiliki:default-page-header
-   :footer        wiliki:default-page-footer
-   :head-elements wiliki:default-head-elements))
+(wiliki:formatter (make <wiliki-formatter>)) ;override the default
 
 ;; Character conv ---------------------------------
 

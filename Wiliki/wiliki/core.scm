@@ -36,6 +36,7 @@
   (use srfi-13)
   (use gauche.parameter)
   (use gauche.charconv)
+  (use gauche.logger)
   (use file.util)
   (use rfc.uri)
   (use www.cgi)
@@ -77,6 +78,11 @@
           wiliki:db-delete! wiliki:db-recent-changes
           wiliki:db-fold wiliki:db-map wiliki:db-for-each
           wiliki:db-search wiliki:db-search-content
+
+          wiliki:log-event
+
+          wiliki:spam-blacklist wiliki:spam-blacklist-append!
+          wiliki:contains-spam?
           ))
 (select-module wiliki.core)
 
@@ -90,6 +96,7 @@
 
 (define wiliki      (make-parameter #f))     ;current instance
 (define wiliki:lang (make-parameter #f))     ;current language
+(define wiliki:event-log-drain (make-parameter #f)) ;event log drain
 
 (define-class <wiliki> ()
   (;; Customization parameters -----------------------
@@ -146,6 +153,9 @@
    (log-file    :accessor log-file       :init-keyword :log-file
                 :init-value #f)
 
+   ;; extra event log for diagnosis.
+   (event-log-file :init-keyword :event-log-file :init-value #f)
+   
    ;; additional paths to search localized messages by gettext.
    ;; (e.g. /usr/local/share/locale)
    (gettext-paths :accessor gettext-paths :init-keyword :gettext-paths
@@ -170,7 +180,12 @@
 ;; Main entry of processing
 (define-method wiliki-main ((self <wiliki>))
   (set! (port-buffering (current-error-port)) :line)
-  (parameterize ((wiliki self))
+  (parameterize ([wiliki self]
+                 [wiliki:event-log-drain
+                  (and (ref self'event-log-file)
+                       (make <log-drain>
+                         :path (wiliki:event-log-file-path self)
+                         :prefix event-log-prefix))])
     (cgi-main
      (lambda (param)
        (let ((pagename (get-page-name self param))
@@ -260,6 +275,7 @@
   )
 
 (define (error-page e)
+  (wiliki:log-event "error: ~a" (ref e'message))
   (wiliki:with-db (lambda ()
                     (wiliki:std-page
                      (make <wiliki-page>
@@ -273,6 +289,13 @@
                              '())))
                      ))
                   :rwmode :read))
+
+;; Set up event log prefix
+(define (event-log-prefix drain)
+  (let1 t (sys-localtime (sys-time))
+    (format "~a ~2d ~2,'0d:~2,'0d:~2,'0d [~a]:"
+            (sys-strftime "%b" t) (ref t'mday) (ref t'hour) (ref t'min)
+            (ref t'sec) (sys-getenv "REMOTE_ADDR"))))
 
 ;;;==================================================================
 ;;; Action framework
@@ -338,6 +361,19 @@
 ;;;==================================================================
 ;;; Gadgets
 ;;;
+
+;; A list of urls or regexps that should be rejected at commit time.
+(define wiliki:spam-blacklist (make-parameter '()))
+
+(define (wiliki:spam-blacklist-append! lis)
+  (wiliki:spam-blacklist (append (wiliki:spam-blacklist) lis)))
+
+(define (wiliki:contains-spam? content)
+  (any (lambda (x)
+         (cond [(regexp? x) (rxmatch x content)]
+               [(string? x) (string-contains content x)]
+               [else #f]))
+       (wiliki:spam-blacklist)))
 
 ;; Returns SXML anchor node and string for given wikiname.
 (define (wiliki:wikiname-anchor wikiname . maybe-anchor-string)
@@ -405,13 +441,18 @@
 
 ;; Returns absolute pathname of the log file, or #f
 (define (wiliki:log-file-path wiliki)
-  (and-let* (wiliki
-             (filename (ref wiliki'log-file)))
-    (if (or (string-prefix? "./" filename)
-            (string-prefix? "../" filename)
-            (string-prefix? "/" filename))
-      filename
-      (build-path (sys-dirname (ref wiliki'db-path)) filename))))
+  (wiliki-prepend-path wiliki (ref wiliki'log-file)))
+
+(define (wiliki:event-log-file-path wiliki)
+  (wiliki-prepend-path wiliki (ref wiliki'event-log-file)))
+
+(define (wiliki-prepend-path wiliki filename)
+  (and (string? filename)
+       (if (or (string-prefix? "./" filename)
+               (string-prefix? "../" filename)
+               (string-prefix? "/" filename))
+         filename
+         (build-path (sys-dirname (ref wiliki'db-path)) filename))))
 
 ;; Standard page 
 (define (wiliki:std-page page . args)
@@ -830,5 +871,13 @@
                   (wiliki:db-record-content-find
                    w v (cut string-contains-ci <> key))))
            maybe-sorter)))
+
+;;;==================================================================
+;;; Event log
+;;;
+
+(define (wiliki:log-event fmt . args)
+  (when (wiliki:event-log-drain)
+    (apply log-format (wiliki:event-log-drain) fmt args)))
 
 (provide "wiliki/core")
